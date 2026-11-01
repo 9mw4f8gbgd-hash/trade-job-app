@@ -32,8 +32,10 @@ test('end to end: visit, quote, approve, parts used, invoice, paid', async () =>
   const pub = await call(`/public/invoice/${d.invoice.token}`);
   assert.equal(pub.invoice.status, 'viewed');
   assert.equal(pub.payments, false);
-  await call(`/invoices/${d.invoice.id}/paid`, { method: 'check' }, token);
+  await call(`/invoices/${d.invoice.id}/paid`, { method: 'check', note: '#1042' }, token);
   const m = await call('/money', null, token);
   assert.equal(m.summary.paid.count, 1);
+  assert.equal(m.invoices[0].paid_method, 'check');
+  assert.equal(m.invoices[0].paid_note, '#1042');
   server.close();
 });

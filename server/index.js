@@ -149,7 +149,8 @@ api.post('/jobs/:id/invoice', wrap(async (req, res) => {
 api.post('/invoices/:id/paid', wrap(async (req, res) => {
   const inv = await one('SELECT * FROM invoices WHERE id = $1 AND shop_id = $2', [req.params.id, req.shopId]);
   if (!inv) throw fail(404, 'Invoice not found');
-  await q('UPDATE invoices SET paid_at = now(), paid_method = $1 WHERE id = $2', [req.body.method || 'cash', inv.id]);
+  const method = ['check', 'cash', 'venmo', 'card', 'other'].includes(req.body.method) ? req.body.method : 'other';
+  await q('UPDATE invoices SET paid_at = now(), paid_method = $1, paid_note = $2 WHERE id = $3', [method, String(req.body.note || '').slice(0, 200), inv.id]);
   await q("UPDATE jobs SET status = 'paid' WHERE id = $1", [inv.job_id]);
   res.json({ ok: true });
 }));
@@ -157,7 +158,7 @@ api.post('/invoices/:id/paid', wrap(async (req, res) => {
 // ---- money dashboard ----
 api.get('/money', wrap(async (req, res) => {
   const rows = await q('SELECT i.*, j.customer_name FROM invoices i JOIN jobs j ON j.id = i.job_id WHERE i.shop_id = $1 ORDER BY i.id DESC', [req.shopId]);
-  const invoices = rows.map((r) => ({ id: r.id, job_id: r.job_id, customer_name: r.customer_name, total: Number(r.total), due_date: r.due_date, status: invoiceStatus(r) }));
+  const invoices = rows.map((r) => ({ id: r.id, job_id: r.job_id, customer_name: r.customer_name, total: Number(r.total), due_date: r.due_date, status: invoiceStatus(r), paid_method: r.paid_method, paid_note: r.paid_note }));
   const summary = {};
   for (const s of ['unpaid', 'viewed', 'overdue', 'paid']) {
     const list = invoices.filter((i) => i.status === s);
