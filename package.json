@@ -1,0 +1,28 @@
+{
+  "name": "trade-job-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n api,web \"node --watch server/index.js\" \"vite web\"",
+    "build": "vite build web",
+    "start": "node server/index.js",
+    "migrate": "node server/migrate-cli.js",
+    "seed": "node server/seed-cli.js",
+    "test": "node --test server/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "pg": "^8.23.1",
+    "pg-mem": "^3.0.14",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^9.2.5",
+    "vite": "^8.3.5"
+  }
+}
