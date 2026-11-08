@@ -7,14 +7,20 @@ import { requireAuth, checkPassword, hashPassword, newToken } from './auth.js';
 import { calc, mergeItems, diffParts, invoiceStatus } from './math.js';
 import { paymentsConfigured, createCheckout } from './stripe.js';
 import { seed } from './seed.js';
+import { parseLogo } from './logo.js';
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
-const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(e.status || 500).json({ error: e.message }); });
+const wrap = (fn) => (req, res) => fn(req, res).catch((e) => {
+  const status = e.status || 500;
+  if (status >= 500) console.error(e);
+  res.status(status).json({ error: e.message });
+});
 const fail = (status, message) => Object.assign(new Error(message), { status });
 const J = (s) => JSON.parse(s || '[]');
 const baseUrl = (req) => process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
 const getShop = (id) => one('SELECT * FROM shops WHERE id = $1', [id]);
+const publicShop = (shop) => ({ name: shop.name, logo: shop.logo || null });
 const money = (row) => row && { ...row, items: J(row.items), ...calc({ items: J(row.items), laborHours: row.labor_hours, hourlyRate: row.hourly_rate, taxRate: row.tax_rate }) };
 const withStatus = (inv) => inv && { ...money(inv), status: invoiceStatus(inv) };
 
@@ -47,6 +53,17 @@ api.get('/me', wrap(async (req, res) => {
 api.put('/settings', wrap(async (req, res) => {
   const { name, hourly_rate, tax_rate } = req.body;
   await q('UPDATE shops SET name = $1, hourly_rate = $2, tax_rate = $3 WHERE id = $4', [name, Number(hourly_rate) || 0, Number(tax_rate) || 0, req.shopId]);
+  res.json(await getShop(req.shopId));
+}));
+api.put('/logo', wrap(async (req, res) => {
+  const incoming = req.body.logo;
+  if (incoming == null || incoming === '') {
+    await q('UPDATE shops SET logo = NULL WHERE id = $1', [req.shopId]);
+  } else {
+    const parsed = parseLogo(incoming);
+    if (parsed.error) throw fail(400, parsed.error);
+    await q('UPDATE shops SET logo = $1 WHERE id = $2', [parsed.dataUrl, req.shopId]);
+  }
   res.json(await getShop(req.shopId));
 }));
 api.get('/users', wrap(async (req, res) => res.json(await q('SELECT id, email, name FROM users WHERE shop_id = $1 ORDER BY id', [req.shopId]))));
@@ -89,6 +106,41 @@ api.put('/jobs/:id', wrap(async (req, res) => {
   const v = jobFields.map((f) => (req.body[f] !== undefined ? req.body[f] : job[f]));
   res.json(await one('UPDATE jobs SET customer_name=$1, phone=$2, address=$3, notes=$4, status=$5, scheduled_at=$6 WHERE id=$7 RETURNING *', [...v, job.id]));
 }));
+// Filing a job away is separate from invoice and payment state.
+api.post('/jobs/:id/complete', wrap(async (req, res) => {
+  const job = await loadJob(req.shopId, req.params.id);
+  res.json(await one('UPDATE jobs SET completed_at = COALESCE(completed_at, now()) WHERE id = $1 RETURNING *', [job.id]));
+}));
+api.post('/jobs/:id/reopen', wrap(async (req, res) => {
+  const job = await loadJob(req.shopId, req.params.id);
+  res.json(await one('UPDATE jobs SET completed_at = NULL WHERE id = $1 RETURNING *', [job.id]));
+}));
+
+function visitItems(list) {
+  const out = [];
+  for (const raw of list || []) {
+    const qty = Number(raw?.qty);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    const name = String(raw?.name ?? '').trim();
+    const priceNum = Number(raw?.price);
+    if (!name) throw fail(400, 'Item name is required');
+    if (!Number.isFinite(priceNum) || priceNum < 0) throw fail(400, 'Unit price must be zero or more');
+    out.push({ name, price: Math.round(priceNum * 100) / 100, qty });
+  }
+  return out;
+}
+function cleanUsedItems(list) {
+  if (!Array.isArray(list)) throw fail(400, 'Items are required');
+  return list.map((raw) => {
+    const name = String(raw?.name ?? '').trim();
+    const qty = Number(raw?.qty);
+    const priceNum = Number(raw?.price);
+    if (!name) throw fail(400, 'Item name is required');
+    if (!Number.isFinite(qty) || qty < 0) throw fail(400, 'Quantity must be zero or more');
+    if (!Number.isFinite(priceNum) || priceNum < 0) throw fail(400, 'Unit price must be zero or more');
+    return { name, price: Math.round(priceNum * 100) / 100, qty, used: !!raw.used };
+  });
+}
 
 // ---- site visits (idempotent by client_id so offline queue can retry safely) ----
 api.post('/visits', wrap(async (req, res) => {
@@ -96,7 +148,7 @@ api.post('/visits', wrap(async (req, res) => {
   const existing = await one('SELECT id FROM visits WHERE client_id = $1', [b.client_id]);
   if (existing) return res.json({ id: existing.id, duplicate: true });
   await loadJob(req.shopId, b.job_id);
-  const items = (b.items || []).map((i) => ({ name: String(i.name), price: Number(i.price) || 0, qty: Number(i.qty) || 0 }));
+  const items = visitItems(b.items);
   const v = await one('INSERT INTO visits (shop_id, job_id, client_id, notes, labor_hours, items, photos) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id',
     [req.shopId, b.job_id, b.client_id, b.notes || '', Number(b.labor_hours) || 0, JSON.stringify(items), JSON.stringify(b.photos || [])]);
   res.json(v);
@@ -125,7 +177,7 @@ api.post('/jobs/:id/quote', wrap(async (req, res) => {
 // ---- parts used ----
 api.put('/jobs/:id/used', wrap(async (req, res) => {
   const job = await loadJob(req.shopId, req.params.id);
-  const items = (req.body.items || []).map((i) => ({ name: String(i.name), price: Number(i.price) || 0, qty: Number(i.qty) || 0, used: !!i.used }));
+  const items = cleanUsedItems(req.body.items);
   const labor = Number(req.body.labor_hours) || 0;
   if (await one('SELECT id FROM parts_used WHERE job_id = $1', [job.id])) await q('UPDATE parts_used SET items = $1, labor_hours = $2 WHERE job_id = $3', [JSON.stringify(items), labor, job.id]);
   else await q('INSERT INTO parts_used (shop_id, job_id, items, labor_hours) VALUES ($1,$2,$3,$4)', [req.shopId, job.id, JSON.stringify(items), labor]);
@@ -173,7 +225,7 @@ pub.get('/quote/:token', wrap(async (req, res) => {
   const qt = await one('SELECT * FROM quotes WHERE token = $1', [req.params.token]);
   if (!qt) throw fail(404, 'Quote not found');
   const job = await one('SELECT customer_name, address FROM jobs WHERE id = $1', [qt.job_id]);
-  res.json({ quote: money(qt), job, shop: { name: (await getShop(qt.shop_id)).name } });
+  res.json({ quote: money(qt), job, shop: publicShop(await getShop(qt.shop_id)) });
 }));
 pub.post('/quote/:token/approve', wrap(async (req, res) => {
   const qt = await one('SELECT * FROM quotes WHERE token = $1', [req.params.token]);
@@ -189,7 +241,7 @@ pub.get('/invoice/:token', wrap(async (req, res) => {
   if (!inv) throw fail(404, 'Invoice not found');
   if (!inv.viewed_at && req.query.preview !== '1') { await q('UPDATE invoices SET viewed_at = now() WHERE id = $1', [inv.id]); inv = { ...inv, viewed_at: new Date() }; }
   const job = await one('SELECT customer_name, address FROM jobs WHERE id = $1', [inv.job_id]);
-  res.json({ invoice: withStatus(inv), job, shop: { name: (await getShop(inv.shop_id)).name }, payments: paymentsConfigured() });
+  res.json({ invoice: withStatus(inv), job, shop: publicShop(await getShop(inv.shop_id)), payments: paymentsConfigured() });
 }));
 pub.post('/invoice/:token/pay', wrap(async (req, res) => {
   if (!paymentsConfigured()) throw fail(400, 'Online payments are not set up yet');

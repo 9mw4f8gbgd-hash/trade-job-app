@@ -8,7 +8,7 @@
     "start": "node server/index.js",
     "migrate": "node server/migrate-cli.js",
     "seed": "node server/seed-cli.js",
-    "test": "node --test server/"
+    "test": "node --test --test-concurrency=1 server/*.test.js web/src/*.test.js"
   },
   "engines": {
     "node": ">=20"

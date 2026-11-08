@@ -1,5 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { api, auth, saveVisit, queued, fmt, uid } from './api.js';
+import { localKey, startOfDay, addDays, addMonths, weekDays, monthGrid, sameDay, inMonth } from './dates.js';
+import { filterJobs } from './jobs.js';
 
 const useHash = () => {
   const [h, setH] = useState(location.hash.slice(1) || '/');
@@ -81,22 +83,26 @@ function Login({ onIn }) {
 
 function Jobs() {
   const [jobs] = useLoad(() => api('/jobs'), []);
-  const [filter, setFilter] = useState('open');
-  const list = (jobs || []).filter((j) => (filter === 'open' ? j.status !== 'paid' : true));
+  const [filter, setFilter] = useState('active');
+  const list = filterJobs(jobs, filter);
+  const empty = filter === 'completed' ? 'No completed jobs.' : filter === 'all' ? 'No jobs yet. Tap New job to add one.' : 'No active jobs. Tap New job to add one.';
   return (
     <>
       <header><h1>Jobs</h1><button className="add" onClick={() => go('/new')}>+ New job</button></header>
-      <div className="seg">{['open', 'all'].map((f) => <button key={f} className={filter === f ? 'on' : ''} onClick={() => setFilter(f)}>{cap(f)}</button>)}</div>
+      <div className="seg">{[['active', 'Active'], ['completed', 'Completed'], ['all', 'All']].map(([f, label]) => <button key={f} type="button" className={filter === f ? 'on' : ''} onClick={() => setFilter(f)}>{label}</button>)}</div>
       {!jobs && <p>Loading...</p>}
       {list.map((j) => <JobRow key={j.id} j={j} />)}
-      {jobs && !list.length && <p className="muted">No jobs yet. Tap New job to add one.</p>}
+      {jobs && !list.length && <p className="muted">{empty}</p>}
     </>
   );
 }
 const JobRow = ({ j }) => (
   <a className="card row" href={`#/job/${j.id}`}>
     <div><b>{j.customer_name}</b><div className="muted">{j.address}</div>{j.scheduled_at && <div className="muted">{new Date(j.scheduled_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</div>}</div>
-    <span className={'pill ' + j.status}>{cap(j.status)}</span>
+    <div className="right">
+      <span className={'pill ' + j.status}>{cap(j.status)}</span>
+      {j.completed_at && <span className="pill">Completed</span>}
+    </div>
   </a>
 );
 
@@ -157,7 +163,13 @@ function Job({ id }) {
           {job.phone && <a className="btn" href={`tel:${job.phone}`}>Call {job.phone}</a>}
           {job.address && <a className="btn" href={`https://maps.google.com/?q=${encodeURIComponent(job.address)}`} target="_blank">Map: {job.address}</a>}
           {job.notes && <p>{job.notes}</p>}
-          <button onClick={() => setEdit(true)}>Edit job</button>
+          <div className="btns">
+            <button type="button" onClick={() => setEdit(true)}>Edit job</button>
+            {job.completed_at
+              ? <button type="button" disabled={!!busy} onClick={() => act('reopen', () => api(`/jobs/${id}/reopen`, {}))}>Reopen job</button>
+              : <button type="button" disabled={!!busy} onClick={() => { if (confirm('Mark this job complete? It leaves the active list. You can reopen it. Invoices and payments stay as they are.')) act('complete', () => api(`/jobs/${id}/complete`, {})); }}>Complete job</button>}
+          </div>
+          {job.completed_at && <p className="muted">Completed {new Date(job.completed_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}. It is off the active list. Invoices and balances are unchanged.</p>}
         </section>
       )}
 
@@ -166,7 +178,7 @@ function Job({ id }) {
         {visits.map((v) => (
           <div key={v.id} className="sub">
             <div className="muted">{new Date(v.created_at).toLocaleString()}</div>
-            {v.items.map((i) => <div key={i.name}>{i.qty} x {i.name}</div>)}
+            {v.items.map((i, n) => <div key={n}>{i.qty} x {i.name} at {fmt(i.price)}</div>)}
             <div>Labor: {Number(v.labor_hours)} hr</div>
             {v.notes && <p>{v.notes}</p>}
             <div className="photos">{v.photos.map((p, k) => <img key={k} src={p} />)}</div>
@@ -225,7 +237,7 @@ function Totals({ doc }) {
   return (
     <table>
       <tbody>
-        {doc.items.map((i) => <tr key={i.name}><td>{i.qty} x {i.name}</td><td>{fmt(i.price * i.qty)}</td></tr>)}
+        {doc.items.map((i, n) => <tr key={n}><td>{i.qty} x {i.name}<div className="muted">{fmt(i.price)} each</div></td><td>{fmt(i.price * i.qty)}</td></tr>)}
         <tr><td>Labor {Number(doc.labor_hours)} hr at {fmt(doc.hourly_rate)}</td><td>{fmt(doc.labor)}</td></tr>
         <tr className="muted"><td>Subtotal</td><td>{fmt(doc.subtotal)}</td></tr>
         <tr className="muted"><td>Tax {Number(doc.tax_rate)}%</td><td>{fmt(doc.tax)}</td></tr>
@@ -249,7 +261,7 @@ function PartsUsed({ id, used, diff, onSaved }) {
       <p className="muted">Check off what you actually used.</p>
       {items.map((i, k) => (
         <div key={k} className="check">
-          <label><input type="checkbox" checked={i.used} onChange={(e) => upd(k, { used: e.target.checked })} /> {i.name}</label>
+          <label><input type="checkbox" checked={i.used} onChange={(e) => upd(k, { used: e.target.checked })} /> {i.name} <span className="muted">{fmt(i.price)}</span></label>
           <input type="number" inputMode="decimal" value={i.qty} onChange={(e) => upd(k, { qty: e.target.value })} />
         </div>
       ))}
@@ -274,14 +286,51 @@ function Visit({ jobId }) {
   const [notes, setNotes] = useState('');
   const [photos, setPhotos] = useState([]);
   const [search, setSearch] = useState('');
+  const [custom, setCustom] = useState({ name: '', qty: '1', price: '' });
   useEffect(() => { api('/parts').then((p) => { localStorage.setItem('parts', JSON.stringify(p)); setParts(p); }).catch(() => {}); }, []);
-  const bump = (p, n) => setCart((c) => { const q = Math.max(0, (c[p.name]?.qty || 0) + n); const x = { ...c, [p.name]: { name: p.name, price: p.price, qty: q } }; if (!q) delete x[p.name]; return x; });
+  const bump = (p, n) => setCart((c) => {
+    const prev = c[p.name];
+    const q = Math.max(0, Number(prev?.qty || 0) + n);
+    if (!q) { const next = { ...c }; delete next[p.name]; return next; }
+    return { ...c, [p.name]: { name: p.name, price: prev ? prev.price : p.price, qty: q } };
+  });
+  const setQty = (name, qty) => setCart((c) => {
+    if (!c[name]) return c;
+    const q = Number(qty);
+    if (!Number.isFinite(q) || q <= 0) { const next = { ...c }; delete next[name]; return next; }
+    return { ...c, [name]: { ...c[name], qty: q } };
+  });
+  const setPrice = (name, price) => setCart((c) => (c[name] ? { ...c, [name]: { ...c[name], price } } : c));
+  const addCustom = () => {
+    const name = custom.name.trim();
+    const qty = Number(custom.qty);
+    const price = Number(custom.price);
+    if (!name) return alert('Enter an item name');
+    if (!Number.isFinite(qty) || qty <= 0) return alert('Quantity must be greater than 0');
+    if (custom.price === '' || !Number.isFinite(price) || price < 0) return alert('Enter a unit price of zero or more');
+    setCart((c) => ({ ...c, [name]: { name, price, qty: (Number(c[name]?.qty) || 0) + qty } }));
+    setCustom({ name: '', qty: '1', price: '' });
+  };
   const addPhoto = (e) => [...e.target.files].forEach((f) => shrink(f).then((d) => setPhotos((p) => [...p, d])));
   const save = async () => {
-    await saveVisit({ client_id: uid(), job_id: Number(jobId), labor_hours: Number(labor), notes, photos, items: Object.values(cart) });
+    const items = Object.values(cart).map((i) => ({ name: String(i.name).trim(), price: Number(i.price), qty: Number(i.qty) })).filter((i) => i.qty > 0);
+    if (items.some((i) => !i.name || !Number.isFinite(i.price) || i.price < 0)) return alert('Each item needs a name and a unit price of zero or more.');
+    await saveVisit({ client_id: uid(), job_id: Number(jobId), labor_hours: Number(labor), notes, photos, items });
     go(`/job/${jobId}`);
   };
   const shown = parts.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()));
+  const lines = Object.values(cart);
+  const extras = lines.filter((i) => !parts.some((p) => p.name === i.name));
+  const editor = (i, cat) => (
+    <div key={i.name} className="item-edit">
+      <b>{i.name}</b>
+      {cat && Number(cat.price) !== Number(i.price) && <div className="muted">Catalog {fmt(cat.price)}</div>}
+      <div className="check">
+        <div className="qty"><button type="button" onClick={() => setQty(i.name, Number(i.qty) - 1)}>-</button><b>{i.qty}</b><button type="button" onClick={() => setQty(i.name, Number(i.qty) + 1)}>+</button></div>
+        <label>Unit price<input aria-label={`Unit price for ${i.name}`} type="number" inputMode="decimal" min="0" step="0.01" value={i.price} onChange={(e) => setPrice(i.name, e.target.value)} /></label>
+      </div>
+    </div>
+  );
   return (
     <>
       <header><a href={`#/job/${jobId}`} className="back">Back</a><h1>Site visit</h1></header>
@@ -290,20 +339,65 @@ function Visit({ jobId }) {
       <div className="parts">
         {shown.map((p) => (
           <div key={p.id} className={'part' + (cart[p.name] ? ' on' : '')}>
-            <button className="pname" onClick={() => bump(p, 1)}>{p.name}<small>{fmt(p.price)}</small></button>
-            {cart[p.name] && <div className="qty"><button onClick={() => bump(p, -1)}>-</button><b>{cart[p.name].qty}</b><button onClick={() => bump(p, 1)}>+</button></div>}
+            <button type="button" className="pname" onClick={() => bump(p, 1)}>{p.name}<small>{fmt(cart[p.name] ? cart[p.name].price : p.price)}</small></button>
+            {cart[p.name] && (
+              <>
+                <div className="qty"><button type="button" onClick={() => bump(p, -1)}>-</button><b>{cart[p.name].qty}</b><button type="button" onClick={() => bump(p, 1)}>+</button></div>
+                <label className="tile-price">Unit price<input aria-label={`Unit price for ${p.name}`} type="number" inputMode="decimal" min="0" step="0.01" value={cart[p.name].price} onChange={(e) => setPrice(p.name, e.target.value)} /></label>
+                {Number(cart[p.name].price) !== Number(p.price) && <div className="muted tile-note">Catalog {fmt(p.price)}</div>}
+              </>
+            )}
           </div>
         ))}
       </div>
       <section className="card">
+        {!!extras.length && <h2>Custom items</h2>}
+        {extras.map((i) => editor(i))}
+        <div className="sub">
+          <b>Add item</b>
+          <p className="muted">For something that is not in the parts list.</p>
+          <label>Name<input value={custom.name} onChange={(e) => setCustom({ ...custom, name: e.target.value })} placeholder="Not in the parts list" /></label>
+          <label>Quantity<input type="number" inputMode="decimal" min="0" step="any" value={custom.qty} onChange={(e) => setCustom({ ...custom, qty: e.target.value })} /></label>
+          <label>Unit price<input aria-label="Custom item unit price" type="number" inputMode="decimal" min="0" step="0.01" value={custom.price} onChange={(e) => setCustom({ ...custom, price: e.target.value })} placeholder="0.00" /></label>
+          <button type="button" onClick={addCustom}>Add item</button>
+        </div>
         <label>Labor hours<input type="number" inputMode="decimal" step="0.25" value={labor} onChange={(e) => setLabor(e.target.value)} /></label>
         <label>Notes<textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="What did you find?" /></label>
         <label className="btn">Add photo<input type="file" accept="image/*" capture="environment" multiple hidden onChange={addPhoto} /></label>
-        <div className="photos">{photos.map((p, k) => <img key={k} src={p} />)}</div>
-        <button className="big green" onClick={save}>Save visit ({Object.keys(cart).length} parts)</button>
+        <div className="photos">{photos.map((p, k) => <img key={k} src={p} alt="" />)}</div>
+        <button type="button" className="big green" onClick={save}>Save visit ({lines.length} items)</button>
       </section>
     </>
   );
+}
+const LOGO_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+function readFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Could not read that image'));
+    reader.readAsDataURL(file);
+  });
+}
+function sniffImageType(bytes) {
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  const head = String.fromCharCode(...bytes.slice(0, 12));
+  if (head.startsWith('GIF87a') || head.startsWith('GIF89a')) return 'image/gif';
+  if (head.startsWith('RIFF') && head.slice(8, 12) === 'WEBP') return 'image/webp';
+  return '';
+}
+async function fileToLogo(file) {
+  if (file.size > 8 * 1024 * 1024) throw new Error('That image is too large');
+  if (file.type && !LOGO_TYPES.includes(file.type)) throw new Error('Use a PNG, JPEG, GIF, or WebP image');
+  if (file.size > 512 * 1024) return shrink(file);
+  const dataUrl = await readFile(file);
+  if (/^data:image\/(png|jpeg|gif|webp);base64,/i.test(String(dataUrl))) return dataUrl;
+  const encoded = String(dataUrl).split(',')[1] || '';
+  const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+  const type = sniffImageType(bytes);
+  if (!type) throw new Error('Use a PNG, JPEG, GIF, or WebP image');
+  return `data:${type};base64,${encoded}`;
 }
 function shrink(file) {
   return new Promise((res) => {
@@ -318,19 +412,74 @@ function shrink(file) {
   });
 }
 
+const DOW = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+function jobsOnDay(jobs, day) {
+  return (jobs || []).filter((j) => j.scheduled_at && localKey(j.scheduled_at) === localKey(day)).sort((a, b) => new Date(a.scheduled_at) - new Date(b.scheduled_at));
+}
+function MonthGrid({ anchor, jobs, onPick }) {
+  const cells = monthGrid(anchor);
+  const counts = {};
+  for (const j of jobs || []) {
+    if (!j.scheduled_at) continue;
+    const k = localKey(j.scheduled_at);
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const today = new Date();
+  return (
+    <div className="cal">
+      {DOW.map((d, i) => <div key={d + i} className="dow">{d}</div>)}
+      {cells.map((c) => {
+        const n = counts[localKey(c)] || 0;
+        const cls = [sameDay(c, anchor) ? 'on' : '', sameDay(c, today) ? 'today' : '', inMonth(c, anchor) ? '' : 'out'].filter(Boolean).join(' ');
+        const label = `${c.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}${n ? `, ${n} job${n === 1 ? '' : 's'}` : ', nothing scheduled'}`;
+        return (
+          <button type="button" key={localKey(c)} className={cls} aria-label={label} onClick={() => onPick(startOfDay(c))}>
+            <span>{c.getDate()}</span>
+            <span className="dot">{n || ''}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 function Schedule() {
-  const [day, setDay] = useState(() => new Date());
+  const [day, setDay] = useState(() => startOfDay(new Date()));
+  const [view, setView] = useState(() => {
+    const saved = sessionStorage.getItem('schedView');
+    return saved === 'week' || saved === 'month' ? saved : 'day';
+  });
   const [jobs] = useLoad(() => api('/jobs'), []);
-  const key = day.toDateString();
-  const list = (jobs || []).filter((j) => j.scheduled_at && new Date(j.scheduled_at).toDateString() === key);
-  const shift = (n) => setDay((d) => new Date(d.getTime() + n * 864e5));
+  const changeView = (next) => { setView(next); sessionStorage.setItem('schedView', next); };
+  const shift = (n) => setDay((d) => (view === 'month' ? addMonths(d, n) : addDays(d, n * (view === 'week' ? 7 : 1))));
+  const week = weekDays(day);
+  const title = view === 'month'
+    ? day.toLocaleDateString([], { month: 'long', year: 'numeric' })
+    : view === 'week'
+      ? `${week[0].toLocaleDateString([], { month: 'short', day: 'numeric' })} - ${week[6].toLocaleDateString([], { month: 'short', day: 'numeric' })}`
+      : day.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
+  const dayList = jobsOnDay(jobs, day);
   return (
     <>
       <header><h1>Schedule</h1><button className="add" onClick={() => go('/new')}>+ New job</button></header>
-      <div className="seg"><button onClick={() => shift(-1)}>Prev</button><button onClick={() => setDay(new Date())}>Today</button><button onClick={() => shift(1)}>Next</button></div>
-      <h2>{day.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}</h2>
-      {list.map((j) => <JobRow key={j.id} j={j} />)}
-      {jobs && !list.length && <p className="muted">Nothing scheduled this day.</p>}
+      <div className="seg">{[['day', 'Day'], ['week', 'Week'], ['month', 'Month']].map(([k, label]) => <button key={k} type="button" className={view === k ? 'on' : ''} onClick={() => changeView(k)}>{label}</button>)}</div>
+      <div className="seg"><button type="button" onClick={() => shift(-1)}>Prev</button><button type="button" onClick={() => setDay(startOfDay(new Date()))}>Today</button><button type="button" onClick={() => shift(1)}>Next</button></div>
+      <h2>{title}</h2>
+      {!jobs && <p>Loading...</p>}
+      {view === 'month' && <MonthGrid anchor={day} jobs={jobs} onPick={setDay} />}
+      {view === 'week' && week.map((d) => (
+        <section key={localKey(d)} className="week-day">
+          <h2 className={sameDay(d, new Date()) ? 'today-label' : ''}>{d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}{sameDay(d, new Date()) ? ' · Today' : ''}</h2>
+          {jobsOnDay(jobs, d).map((j) => <JobRow key={j.id} j={j} />)}
+          {jobs && !jobsOnDay(jobs, d).length && <p className="muted">Nothing scheduled</p>}
+        </section>
+      ))}
+      {view !== 'week' && (
+        <>
+          {view === 'month' && <h2>{day.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}</h2>}
+          {dayList.map((j) => <JobRow key={j.id} j={j} />)}
+          {jobs && !dayList.length && <p className="muted">Nothing scheduled this day.</p>}
+        </>
+      )}
     </>
   );
 }
@@ -365,7 +514,17 @@ function Settings() {
   const [nu, setNu] = useState({ email: '', name: '', password: '' });
   useEffect(() => { if (me) setS(me.shop); }, [me]);
   if (!s) return <p>Loading...</p>;
-  const save = async () => { await api('/settings', s, 'PUT'); reload(); alert('Saved'); };
+  const save = async () => { await api('/settings', { name: s.name, hourly_rate: s.hourly_rate, tax_rate: s.tax_rate }, 'PUT'); reload(); alert('Saved'); };
+  const onLogo = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    try { setS(await api('/logo', { logo: await fileToLogo(file) }, 'PUT')); } catch (err) { alert(err.message); }
+  };
+  const removeLogo = async () => {
+    if (!confirm('Remove the shop logo?')) return;
+    try { setS(await api('/logo', { logo: null }, 'PUT')); } catch (err) { alert(err.message); }
+  };
   const addUser = async (e) => { e.preventDefault(); try { await api('/users', nu); setNu({ email: '', name: '', password: '' }); reloadUsers(); } catch (e) { alert(e.message); } };
   return (
     <>
@@ -375,6 +534,13 @@ function Settings() {
         <label>Hourly labor rate ($)<input type="number" inputMode="decimal" value={s.hourly_rate} onChange={(e) => setS({ ...s, hourly_rate: e.target.value })} /></label>
         <label>Tax rate (%)<input type="number" inputMode="decimal" step="0.01" value={s.tax_rate} onChange={(e) => setS({ ...s, tax_rate: e.target.value })} /></label>
         <button className="big" onClick={save}>Save settings</button>
+      </section>
+      <section className="card">
+        <h2>Logo</h2>
+        <p className="muted">Optional. Shows on quotes and invoices you give the customer.</p>
+        {s.logo ? <img className="logo" src={s.logo} alt="Shop logo preview" /> : <p className="muted">No logo. Customers see your shop name only.</p>}
+        <label className="btn">{s.logo ? 'Replace logo' : 'Upload logo'}<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden onChange={onLogo} /></label>
+        {s.logo && <button type="button" onClick={removeLogo}>Remove logo</button>}
       </section>
       <section className="card">
         <h2>Card payments</h2>
@@ -396,13 +562,22 @@ function Settings() {
   );
 }
 
+function ShopHead({ shop }) {
+  return (
+    <div className="shop-head">
+      {shop.logo ? <img className="logo" src={shop.logo} alt="" /> : null}
+      <h1>{shop.name}</h1>
+    </div>
+  );
+}
 function PublicQuote({ token }) {
   const [d, reload, err] = useLoad(() => api(`/public/quote/${token}`), [token]);
   if (err) return <main><p className="msg">{err}</p></main>;
   if (!d) return <main><p>Loading...</p></main>;
   return (
     <main className="public">
-      <h1>{d.shop.name}</h1>
+      <ShopHead shop={d.shop} />
+      <button type="button" className="no-print" onClick={() => window.print()}>Print</button>
       <p>Quote for {d.job.customer_name}<br /><span className="muted">{d.job.address}</span></p>
       {d.quote.notes && <p>{d.quote.notes}</p>}
       <Totals doc={d.quote} />
@@ -420,7 +595,8 @@ function PublicInvoice({ token }) {
   const pay = async () => { try { location.href = (await api(`/public/invoice/${token}/pay`, {})).url; } catch (e) { alert(e.message); } };
   return (
     <main className="public">
-      <h1>{d.shop.name}</h1>
+      <ShopHead shop={d.shop} />
+      <button type="button" className="no-print" onClick={() => window.print()}>Print</button>
       <p>Invoice #{inv.id} for {d.job.customer_name}<br /><span className="muted">Due {String(inv.due_date).slice(0, 10)}</span></p>
       <Totals doc={inv} />
       {inv.paid_at ? <p className="ok big-text">Paid by {cap(inv.paid_method)}. Thank you!</p>
