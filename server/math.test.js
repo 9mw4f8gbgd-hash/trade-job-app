@@ -23,6 +23,16 @@ test('parts diff', () => {
   const d = diffParts([{ name: 'A', qty: 2 }, { name: 'B', qty: 1 }], [{ name: 'A', qty: 3 }, { name: 'C', qty: 1 }]);
   assert.deepEqual(d, [{ name: 'A', quoted: 2, used: 3, delta: 1 }, { name: 'B', quoted: 1, used: 0, delta: -1 }, { name: 'C', quoted: 0, used: 1, delta: 1 }]);
 });
+test('merge keeps different unit prices on separate lines', () => {
+  assert.deepEqual(
+    mergeItems([[{ name: 'A', price: 10, qty: 1 }], [{ name: 'A', price: 12.5, qty: 2 }, { name: 'A', price: 10, qty: 1 }]]),
+    [{ name: 'A', price: 10, qty: 2 }, { name: 'A', price: 12.5, qty: 2 }],
+  );
+});
+test('diff sums a name even when unit prices differ', () => {
+  const d = diffParts([{ name: 'A', price: 10, qty: 1 }, { name: 'A', price: 12, qty: 2 }], [{ name: 'A', price: 10, qty: 4 }]);
+  assert.deepEqual(d, [{ name: 'A', quoted: 3, used: 4, delta: 1 }]);
+});
 test('invoice status', () => {
   assert.equal(invoiceStatus({ due_date: '2026-12-01' }, '2026-11-01'), 'unpaid');
   assert.equal(invoiceStatus({ due_date: '2026-12-01', viewed_at: 'x' }, '2026-11-01'), 'viewed');

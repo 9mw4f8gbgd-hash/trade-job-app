@@ -1,11 +1,16 @@
 export const auth = { get token() { return localStorage.getItem('token'); }, set token(t) { t ? localStorage.setItem('token', t) : localStorage.removeItem('token'); } };
 
 export async function api(path, body, method) {
-  const r = await fetch('/api' + path, {
-    method: method || (body ? 'POST' : 'GET'),
-    headers: { 'Content-Type': 'application/json', ...(auth.token && { Authorization: 'Bearer ' + auth.token }) },
-    body: body && JSON.stringify(body),
-  });
+  let r;
+  try {
+    r = await fetch('/api' + path, {
+      method: method || (body ? 'POST' : 'GET'),
+      headers: { 'Content-Type': 'application/json', ...(auth.token && { Authorization: 'Bearer ' + auth.token }) },
+      body: body && JSON.stringify(body),
+    });
+  } catch {
+    throw new Error('You are offline. Saved visits will sync when this phone is back online.');
+  }
   const j = await r.json().catch(() => ({}));
   if (r.status === 401 && !path.startsWith('/auth')) { auth.token = null; location.hash = '#/'; location.reload(); }
   if (!r.ok) throw new Error(j.error || 'Something went wrong');
