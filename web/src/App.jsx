@@ -28,6 +28,30 @@ export default function App() {
   if (path.startsWith('/i/')) return <PublicInvoice token={path.slice(3)} />;
   if (path.startsWith('/magic/')) { auth.token = path.slice(7); setTimeout(() => { setToken(auth.token); go('/'); }); return null; }
   if (!token) return <Login onIn={(t) => { auth.token = t; setToken(t); }} />;
+  return <Authed path={path} />;
+}
+
+const TRADES = [['plumbing', 'Plumbing'], ['well', 'Well services'], ['both', 'Both']];
+function TradePrompt({ onDone }) {
+  const [err, setErr] = useState('');
+  const pick = async (trade) => {
+    try { await api('/trade', { trade }, 'PUT'); onDone(); } catch (e) { setErr(e.message); }
+  };
+  return (
+    <main className="login">
+      <h1>What work do you do?</h1>
+      <p className="muted">This chooses which parts and labor show on a site visit. You can change it later in Settings.</p>
+      {TRADES.map(([value, label]) => <button key={value} type="button" className="big" onClick={() => pick(value)}>{label}</button>)}
+      {err && <p className="msg">{err}</p>}
+    </main>
+  );
+}
+
+function Authed({ path }) {
+  const [me, reload, err] = useLoad(() => api('/me'), []);
+  if (err) return <main><p className="msg">{err}</p></main>;
+  if (!me) return <main><p>Loading...</p></main>;
+  if (!me.shop.trade) return <TradePrompt onDone={reload} />;
   let screen;
   if (path.startsWith('/job/') && path.endsWith('/visit')) screen = <Visit jobId={path.split('/')[2]} />;
   else if (path.startsWith('/job/')) screen = <Job id={path.split('/')[2]} />;
@@ -251,7 +275,8 @@ function PartsUsed({ id, used, diff, onSaved }) {
   const [items, setItems] = useState(used.items);
   const [labor, setLabor] = useState(used.labor_hours);
   const [extra, setExtra] = useState('');
-  const parts = cachedParts();
+  const [parts, setParts] = useState(cachedParts());
+  useEffect(() => { api('/parts').then((p) => { localStorage.setItem('parts', JSON.stringify(p)); setParts(p); }).catch(() => {}); }, []);
   const upd = (k, patch) => setItems(items.map((i, n) => (n === k ? { ...i, ...patch } : i)));
   const add = () => { const p = parts.find((p) => p.name === extra); if (p) setItems([...items, { name: p.name, price: p.price, qty: 1, used: true }]); setExtra(''); };
   const save = async () => { await api(`/jobs/${id}/used`, { items, labor_hours: labor }, 'PUT'); onSaved(); };
@@ -287,7 +312,12 @@ function Visit({ jobId }) {
   const [photos, setPhotos] = useState([]);
   const [search, setSearch] = useState('');
   const [custom, setCustom] = useState({ name: '', qty: '1', price: '' });
-  useEffect(() => { api('/parts').then((p) => { localStorage.setItem('parts', JSON.stringify(p)); setParts(p); }).catch(() => {}); }, []);
+  const [trade, setTrade] = useState('');
+  const [partsReady, setPartsReady] = useState(false);
+  useEffect(() => {
+    api('/parts').then((p) => { localStorage.setItem('parts', JSON.stringify(p)); setParts(p); setPartsReady(true); }).catch(() => {});
+    api('/me').then((m) => setTrade(m.shop.trade || '')).catch(() => {});
+  }, []);
   const bump = (p, n) => setCart((c) => {
     const prev = c[p.name];
     const q = Math.max(0, Number(prev?.qty || 0) + n);
@@ -335,7 +365,10 @@ function Visit({ jobId }) {
     <>
       <header><a href={`#/job/${jobId}`} className="back">Back</a><h1>Site visit</h1></header>
       <input placeholder="Search parts" value={search} onChange={(e) => setSearch(e.target.value)} />
-      {!parts.length && <p className="muted">Parts list not loaded yet. Open this once while online.</p>}
+      {trade === 'plumbing' && <p className="muted">Plumbing parts</p>}
+      {trade === 'well' && <p className="muted">Well services parts</p>}
+      {trade === 'both' && <p className="muted">Plumbing and well parts</p>}
+      {!parts.length && <p className="muted">{partsReady ? 'No parts for this trade. Add an item below, or change trade in Settings.' : 'Parts list not loaded yet. Open this once while online.'}</p>}
       <div className="parts">
         {shown.map((p) => (
           <div key={p.id} className={'part' + (cart[p.name] ? ' on' : '')}>
@@ -529,6 +562,13 @@ function Settings() {
   return (
     <>
       <header><h1>Settings</h1></header>
+      <section className="card">
+        <h2>Trade</h2>
+        <p className="muted">Which parts and labor show on a site visit.</p>
+        {TRADES.map(([value, label]) => (
+          <button key={value} type="button" className={'choice' + (s.trade === value ? ' on' : '')} onClick={async () => { try { setS(await api('/trade', { trade: value }, 'PUT')); } catch (e) { alert(e.message); } }}>{label}</button>
+        ))}
+      </section>
       <section className="card">
         <label>Shop name<input value={s.name} onChange={(e) => setS({ ...s, name: e.target.value })} /></label>
         <label>Hourly labor rate ($)<input type="number" inputMode="decimal" value={s.hourly_rate} onChange={(e) => setS({ ...s, hourly_rate: e.target.value })} /></label>
