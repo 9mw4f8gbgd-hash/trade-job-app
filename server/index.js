@@ -8,6 +8,7 @@ import { calc, mergeItems, diffParts, invoiceStatus } from './math.js';
 import { paymentsConfigured, createCheckout } from './stripe.js';
 import { seed } from './seed.js';
 import { parseLogo } from './logo.js';
+import { TRADES } from './catalog.js';
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
@@ -50,9 +51,19 @@ api.use(requireAuth);
 api.get('/me', wrap(async (req, res) => {
   res.json({ user: await one('SELECT id, email, name FROM users WHERE id = $1', [req.userId]), shop: await getShop(req.shopId) });
 }));
+const cleanTrade = (value) => {
+  const trade = String(value || '').toLowerCase();
+  if (!TRADES.includes(trade)) throw fail(400, 'Pick Plumbing, Well services, or Both');
+  return trade;
+};
 api.put('/settings', wrap(async (req, res) => {
   const { name, hourly_rate, tax_rate } = req.body;
   await q('UPDATE shops SET name = $1, hourly_rate = $2, tax_rate = $3 WHERE id = $4', [name, Number(hourly_rate) || 0, Number(tax_rate) || 0, req.shopId]);
+  if (req.body.trade != null && req.body.trade !== '') await q('UPDATE shops SET trade = $1 WHERE id = $2', [cleanTrade(req.body.trade), req.shopId]);
+  res.json(await getShop(req.shopId));
+}));
+api.put('/trade', wrap(async (req, res) => {
+  await q('UPDATE shops SET trade = $1 WHERE id = $2', [cleanTrade(req.body.trade), req.shopId]);
   res.json(await getShop(req.shopId));
 }));
 api.put('/logo', wrap(async (req, res) => {
@@ -74,8 +85,20 @@ api.post('/users', wrap(async (req, res) => {
 }));
 
 // ---- parts ----
-api.get('/parts', wrap(async (req, res) => res.json((await q('SELECT * FROM parts WHERE shop_id = $1 ORDER BY name', [req.shopId])).map((p) => ({ ...p, price: Number(p.price) })))));
-api.post('/parts', wrap(async (req, res) => res.json(await one('INSERT INTO parts (shop_id, name, price) VALUES ($1,$2,$3) RETURNING *', [req.shopId, req.body.name, Number(req.body.price) || 0]))));
+api.get('/parts', wrap(async (req, res) => {
+  const shop = await getShop(req.shopId);
+  const rows = await q(
+    `SELECT * FROM parts WHERE shop_id = $1 AND (COALESCE($2, 'both') = 'both' OR trade = 'both' OR trade = $2) ORDER BY name`,
+    [req.shopId, shop.trade],
+  );
+  res.json(rows.map((p) => ({ ...p, price: Number(p.price) })));
+}));
+api.post('/parts', wrap(async (req, res) => {
+  const shop = await getShop(req.shopId);
+  const trade = TRADES.includes(req.body.trade) ? req.body.trade : (shop.trade && shop.trade !== 'both' ? shop.trade : 'both');
+  const row = await one('INSERT INTO parts (shop_id, name, price, trade) VALUES ($1,$2,$3,$4) RETURNING *', [req.shopId, req.body.name, Number(req.body.price) || 0, trade]);
+  res.json({ ...row, price: Number(row.price) });
+}));
 
 // ---- jobs ----
 const jobFields = ['customer_name', 'phone', 'address', 'notes', 'status', 'scheduled_at'];
