@@ -4,12 +4,16 @@ import { CATALOG } from './catalog.js';
 
 export const STARTER_PARTS = CATALOG.map(([name, price]) => [name, price]);
 
+export async function seedShopParts(shopId) {
+  for (const [name, price, trade] of CATALOG) await q('INSERT INTO parts (shop_id, name, price, trade) VALUES ($1,$2,$3,$4)', [shopId, name, price, trade]);
+}
+
 export async function seed({ demo = true } = {}) {
   if (await one('SELECT id FROM shops LIMIT 1')) return console.log('seed skipped, data exists');
   const shop = await one("INSERT INTO shops (name, hourly_rate, tax_rate) VALUES ('Demo Well and Plumbing', 95, 6.5) RETURNING id");
-  for (const [email, name] of [['owner@demo.test', 'Owner'], ['tech@demo.test', 'Tech'], ['office@demo.test', 'Office']])
-    await q('INSERT INTO users (shop_id, email, name, password_hash) VALUES ($1,$2,$3,$4)', [shop.id, email, name, hashPassword('demo1234')]);
-  for (const [name, price, trade] of CATALOG) await q('INSERT INTO parts (shop_id, name, price, trade) VALUES ($1,$2,$3,$4)', [shop.id, name, price, trade]);
+  for (const [email, name, role] of [['owner@demo.test', 'Owner', 'owner'], ['tech@demo.test', 'Tech', 'tech'], ['office@demo.test', 'Office', 'tech']])
+    await q('INSERT INTO users (shop_id, email, name, password_hash, role) VALUES ($1,$2,$3,$4,$5)', [shop.id, email, name, hashPassword('demo1234'), role]);
+  await seedShopParts(shop.id);
   if (demo) {
     const day = (d, h) => { const t = new Date(); t.setDate(t.getDate() + d); t.setHours(h, 0, 0, 0); return t.toISOString(); };
     const jobs = [

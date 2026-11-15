@@ -2,13 +2,14 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { connect, migrate, q, one, inMemory } from './db.js';
+import { connect, migrate, pool, q, one, inMemory } from './db.js';
 import { requireAuth, checkPassword, hashPassword, newToken } from './auth.js';
 import { calc, mergeItems, diffParts, invoiceStatus } from './math.js';
 import { paymentsConfigured, createCheckout } from './stripe.js';
-import { seed } from './seed.js';
+import { seed, seedShopParts } from './seed.js';
 import { parseLogo } from './logo.js';
 import { TRADES } from './catalog.js';
+import { rateLimit } from './rate.js';
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
@@ -25,12 +26,62 @@ const publicShop = (shop) => ({ name: shop.name, logo: shop.logo || null });
 const money = (row) => row && { ...row, items: J(row.items), ...calc({ items: J(row.items), laborHours: row.labor_hours, hourlyRate: row.hourly_rate, taxRate: row.tax_rate }) };
 const withStatus = (inv) => inv && { ...money(inv), status: invoiceStatus(inv) };
 
+const cleanTrade = (value) => {
+  const trade = String(value || '').toLowerCase();
+  if (!TRADES.includes(trade)) throw fail(400, 'Pick Plumbing, Well services, or Both');
+  return trade;
+};
+const cleanEmail = (value) => {
+  const email = String(value || '').toLowerCase().trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail(400, 'Enter a valid email');
+  return email;
+};
+const guard = (req, bucket, max) => {
+  if (!rateLimit(req, bucket, max)) throw fail(429, 'Too many attempts. Try again in a few minutes.');
+};
+
 // ---- auth ----
 app.post('/api/auth/login', wrap(async (req, res) => {
-  const u = await one('SELECT * FROM users WHERE email = $1', [String(req.body.email || '').toLowerCase().trim()]);
+  guard(req, 'login', 30);
+  const u = await one('SELECT * FROM users WHERE lower(email) = $1', [String(req.body.email || '').toLowerCase().trim()]);
   if (!u || !checkPassword(req.body.password || '', u.password_hash)) throw fail(401, 'Wrong email or password');
   const token = newToken();
   await q('INSERT INTO sessions (token, user_id, shop_id) VALUES ($1,$2,$3)', [token, u.id, u.shop_id]);
+  res.json({ token });
+}));
+app.post('/api/auth/signup', wrap(async (req, res) => {
+  guard(req, 'signup', 8);
+  const shopName = String(req.body.shop_name || '').trim();
+  const ownerName = String(req.body.owner_name || '').trim();
+  const email = cleanEmail(req.body.email);
+  const password = String(req.body.password || '');
+  const trade = cleanTrade(req.body.trade);
+  if (!shopName) throw fail(400, 'Shop name is required');
+  if (!ownerName) throw fail(400, 'Your name is required');
+  if (password.length < 8) throw fail(400, 'Password must be at least 8 characters');
+  if (password !== String(req.body.confirm || '')) throw fail(400, 'Passwords do not match');
+  if (await one('SELECT id FROM users WHERE lower(email) = $1', [email])) throw fail(400, 'That email is already in use');
+  const client = await pool.connect();
+  let shopId;
+  let userId;
+  try {
+    await client.query('BEGIN');
+    shopId = (await client.query('INSERT INTO shops (name, hourly_rate, tax_rate, trade) VALUES ($1, 95, 0, $2) RETURNING id', [shopName.slice(0, 120), trade])).rows[0].id;
+    userId = (await client.query(
+      'INSERT INTO users (shop_id, email, name, password_hash, role) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+      [shopId, email, ownerName.slice(0, 80), hashPassword(password), 'owner'],
+    )).rows[0].id;
+    await client.query('COMMIT');
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch { /* already closed */ }
+    if (String(e.message || '').toLowerCase().includes('unique') || e.code === '23505') throw fail(400, 'That email is already in use');
+    throw e;
+  } finally {
+    client.release();
+  }
+  await seedShopParts(shopId);
+  const token = newToken();
+  await q('INSERT INTO sessions (token, user_id, shop_id) VALUES ($1,$2,$3)', [token, userId, shopId]);
   res.json({ token });
 }));
 // Magic link stub: logs link to server console instead of emailing.
@@ -49,13 +100,8 @@ const api = express.Router();
 api.use(requireAuth);
 
 api.get('/me', wrap(async (req, res) => {
-  res.json({ user: await one('SELECT id, email, name FROM users WHERE id = $1', [req.userId]), shop: await getShop(req.shopId) });
+  res.json({ user: await one('SELECT id, email, name, role FROM users WHERE id = $1', [req.userId]), shop: await getShop(req.shopId) });
 }));
-const cleanTrade = (value) => {
-  const trade = String(value || '').toLowerCase();
-  if (!TRADES.includes(trade)) throw fail(400, 'Pick Plumbing, Well services, or Both');
-  return trade;
-};
 api.put('/settings', wrap(async (req, res) => {
   const { name, hourly_rate, tax_rate } = req.body;
   await q('UPDATE shops SET name = $1, hourly_rate = $2, tax_rate = $3 WHERE id = $4', [name, Number(hourly_rate) || 0, Number(tax_rate) || 0, req.shopId]);
@@ -77,11 +123,20 @@ api.put('/logo', wrap(async (req, res) => {
   }
   res.json(await getShop(req.shopId));
 }));
-api.get('/users', wrap(async (req, res) => res.json(await q('SELECT id, email, name FROM users WHERE shop_id = $1 ORDER BY id', [req.shopId]))));
+api.get('/users', wrap(async (req, res) => res.json(await q('SELECT id, email, name, role FROM users WHERE shop_id = $1 ORDER BY id', [req.shopId]))));
 api.post('/users', wrap(async (req, res) => {
-  const { email, name, password } = req.body;
-  if (!email || !password) throw fail(400, 'Email and password are required');
-  res.json(await one('INSERT INTO users (shop_id, email, name, password_hash) VALUES ($1,$2,$3,$4) RETURNING id, email, name', [req.shopId, email.toLowerCase().trim(), name || '', hashPassword(password)]));
+  const me = await one('SELECT role FROM users WHERE id = $1', [req.userId]);
+  if (me.role !== 'owner') throw fail(403, 'Only the shop owner can add a technician');
+  const email = cleanEmail(req.body.email);
+  const name = String(req.body.name || '').trim();
+  const password = String(req.body.password || '');
+  if (!name) throw fail(400, 'Name is required');
+  if (password.length < 8) throw fail(400, 'Password must be at least 8 characters');
+  if (await one('SELECT id FROM users WHERE lower(email) = $1', [email])) throw fail(400, 'That email is already in use');
+  res.json(await one(
+    'INSERT INTO users (shop_id, email, name, password_hash, role) VALUES ($1,$2,$3,$4,$5) RETURNING id, email, name, role',
+    [req.shopId, email, name.slice(0, 80), hashPassword(password), 'tech'],
+  ));
 }));
 
 // ---- parts ----
