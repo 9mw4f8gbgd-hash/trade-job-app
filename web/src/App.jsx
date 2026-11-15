@@ -27,6 +27,7 @@ export default function App() {
   if (path.startsWith('/q/')) return <PublicQuote token={path.slice(3)} />;
   if (path.startsWith('/i/')) return <PublicInvoice token={path.slice(3)} />;
   if (path.startsWith('/magic/')) { auth.token = path.slice(7); setTimeout(() => { setToken(auth.token); go('/'); }); return null; }
+  if (path === '/signup') return <Signup onIn={(t) => { auth.token = t; setToken(t); go('/'); }} />;
   if (!token) return <Login onIn={(t) => { auth.token = t; setToken(t); }} />;
   return <Authed path={path} />;
 }
@@ -99,8 +100,38 @@ function Login({ onIn }) {
         <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
         <button className="big">Log in</button>
       </form>
+      <button className="link" onClick={() => go('/signup')}>Create a shop</button>
       <button className="link" onClick={async () => setMsg((await api('/auth/magic', { email })).message)}>Email me a login link instead</button>
       {msg && <p className="msg">{msg}</p>}
+    </main>
+  );
+}
+
+function Signup({ onIn }) {
+  const [f, setF] = useState({ shop_name: '', owner_name: '', email: '', password: '', confirm: '', trade: 'both' });
+  const [msg, setMsg] = useState('');
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const submit = async (e) => {
+    e.preventDefault();
+    if (f.password.length < 8) return setMsg('Password must be at least 8 characters');
+    if (f.password !== f.confirm) return setMsg('Passwords do not match');
+    try { onIn((await api('/auth/signup', f)).token); } catch (err) { setMsg(err.message); }
+  };
+  return (
+    <main className="login">
+      <h1>Create a shop</h1>
+      <form onSubmit={submit}>
+        <label>Shop name<input value={f.shop_name} onChange={set('shop_name')} required /></label>
+        <label>Your name<input value={f.owner_name} onChange={set('owner_name')} required /></label>
+        <label>Email<input type="email" value={f.email} onChange={set('email')} required /></label>
+        <label>Password<input type="password" value={f.password} onChange={set('password')} minLength={8} required /></label>
+        <label>Confirm password<input type="password" value={f.confirm} onChange={set('confirm')} minLength={8} required /></label>
+        <p className="muted">Trade</p>
+        {TRADES.map(([value, label]) => <button key={value} type="button" className={'choice' + (f.trade === value ? ' on' : '')} onClick={() => setF({ ...f, trade: value })}>{label}</button>)}
+        {msg && <p className="msg">{msg}</p>}
+        <button className="big">Create shop</button>
+      </form>
+      <button className="link" type="button" onClick={() => go('/')}>Back to log in</button>
     </main>
   );
 }
@@ -588,13 +619,17 @@ function Settings() {
       </section>
       <section className="card">
         <h2>People</h2>
-        {(users || []).map((u) => <div key={u.id}>{u.name || u.email} <span className="muted">{u.email}</span></div>)}
-        <form onSubmit={addUser}>
-          <input placeholder="Name" value={nu.name} onChange={(e) => setNu({ ...nu, name: e.target.value })} />
-          <input type="email" placeholder="Email" value={nu.email} onChange={(e) => setNu({ ...nu, email: e.target.value })} required />
-          <input type="password" placeholder="Password" value={nu.password} onChange={(e) => setNu({ ...nu, password: e.target.value })} required />
-          <button>Add person</button>
-        </form>
+        <p className="muted">Technicians share this shop. They sign in with the email and temporary password you set.</p>
+        {(users || []).map((u) => <div key={u.id}>{u.name || u.email} <span className="muted">{u.email} · {u.role === 'tech' ? 'Technician' : 'Owner'}</span></div>)}
+        {me.user.role !== 'tech' && (
+          <form onSubmit={addUser}>
+            <b>Add technician</b>
+            <label>Name<input placeholder="Name" value={nu.name} onChange={(e) => setNu({ ...nu, name: e.target.value })} required /></label>
+            <label>Email<input type="email" placeholder="Email" value={nu.email} onChange={(e) => setNu({ ...nu, email: e.target.value })} required /></label>
+            <label>Temporary password<input type="password" placeholder="At least 8 characters" value={nu.password} onChange={(e) => setNu({ ...nu, password: e.target.value })} minLength={8} required /></label>
+            <button className="big">Add technician</button>
+          </form>
+        )}
       </section>
       <p className="muted">Logged in as {me.user.email}</p>
       <button onClick={() => { auth.token = null; location.reload(); }}>Log out</button>
